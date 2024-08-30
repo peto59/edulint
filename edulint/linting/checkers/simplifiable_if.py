@@ -15,6 +15,8 @@ from edulint.linting.checkers.utils import (
     is_any_assign,
     is_pure_builtin,
     get_const_value,
+    is_number,
+    implies,
 )
 
 ExprRepresentation = str
@@ -215,6 +217,11 @@ class SimplifiableIf(BaseChecker):  # type: ignore
             "'%s' can be replaced with '%s'",
             "simplifiable-test-by-equals",
             "Emitted when there is a problem like 'x % 2 == 0 and y % 2 == 0 or x % 2 == 1 and y % 2 == 1' and suggests 'x % 2 == y % 2'.",
+        ),
+        "R6216": (
+            "'%s' can be replaced with '%s'",
+            "redundant condition part",
+            "Emitted when there is a problem like 'A or B', where A implies B and suggests to simplify the condition to just 'B'",
         ),
     }
 
@@ -480,10 +487,6 @@ class SimplifiableIf(BaseChecker):  # type: ignore
         left, (comp, right) = node.left, node.ops[0]
         return left, comp, right
 
-    def _is_number(self, node: nodes.NodeNG) -> bool:
-        const_val = get_const_value(node)
-        return isinstance(const_val, (int, float)) and not isinstance(const_val, bool)
-
     def _get_node_comparator_const_value(self, node: nodes.NodeNG) -> NodeCmpValue:
         """
         Assumes that node is a child of Bool Op.
@@ -498,8 +501,8 @@ class SimplifiableIf(BaseChecker):  # type: ignore
 
         left, comp, right = self._get_values_and_comparator(node)
 
-        left_is_number = self._is_number(left)
-        right_is_number = self._is_number(right)
+        left_is_number = is_number(left)
+        right_is_number = is_number(right)
 
         if (
             (left_is_number and right_is_number)
@@ -1023,8 +1026,8 @@ class SimplifiableIf(BaseChecker):  # type: ignore
     ) -> Optional[Tuple[ExprRepresentation, int, Comparison, Value]]:
         left, cmp, right = self._get_values_and_comparator(node)
 
-        left_is_number = self._is_number(left)
-        right_is_number = self._is_number(right)
+        left_is_number = is_number(left)
+        right_is_number = is_number(right)
 
         if (left_is_number and right_is_number) or (not left_is_number and not right_is_number):
             return None
@@ -1032,7 +1035,7 @@ class SimplifiableIf(BaseChecker):  # type: ignore
         if left_is_number:
             left, cmp, right = right, cmp, left
 
-        if not isinstance(left, nodes.BinOp) or left.op != "%" or not self._is_number(left.right):
+        if not isinstance(left, nodes.BinOp) or left.op != "%" or not is_number(left.right):
             return None
 
         mod = get_const_value(left.right)
@@ -1148,12 +1151,49 @@ class SimplifiableIf(BaseChecker):  # type: ignore
             isinstance(node, nodes.Compare)
             and len(node.ops) == 1
             and node.ops[0][0] in self.SWITCHED_COMPARATOR
-            and not self._is_number(node.left)
-            and not self._is_number(node.ops[0][1])
+            and not is_number(node.left)
+            and not is_number(node.ops[0][1])
         )
 
-    def _make_suggestion_for_redundant_condition_part(self) -> None:
-        pass
+    def _make_suggestion_for_redundant_condition_part(self, node: nodes.BoolOp) -> None:
+        removed_condition = [False for _ in range(len(node.values))]
+        removed_nothing = True
+
+        for i in range(len(node.values)):
+            if removed_condition[i]:
+                continue
+
+            for j in range(len(node.values)):
+                if i == j or removed_condition[j]:
+                    continue
+
+                if node.op == "or" and implies(node.values[i], node.values[j]):
+                    removed_condition[i] = True
+                    removed_nothing = False
+                    break
+
+                if node.op == "and" and implies(node.values[i], node.values[j]):
+                    removed_condition[j] = True
+                    removed_nothing = False
+                    continue
+
+        if removed_nothing:
+            return
+
+        self.add_message(
+            "redundant condition part",
+            node=node,
+            args=(
+                node.as_string(),
+                f" {node.op} ".join(
+                    [
+                        node.values[i].as_string()
+                        for i in range(len(node.values))
+                        if not removed_condition[i]
+                    ]
+                ),
+            ),
+        )
 
     def _check_for_simplification_of_boolop(self, node: nodes.BoolOp) -> None:
         if node.op is None:
@@ -1220,7 +1260,9 @@ class SimplifiableIf(BaseChecker):  # type: ignore
         )
 
         if not made_suggestion:
-            self._make_suggestion_for_redundant_condition_part()
+            made_suggestion = (
+                self._make_suggestion_for_redundant_condition_part(node) or made_suggestion
+            )
 
     @only_required_for_messages(
         "simplifiable-with-abs",
@@ -1228,6 +1270,7 @@ class SimplifiableIf(BaseChecker):  # type: ignore
         "redundant-compare-avoidable-with-max-min",
         "using-compare-instead-of-equal",
         "simplifiable-test-by-equals",
+        "redundant condition part",
     )
     def visit_boolop(self, node: nodes.BoolOp) -> None:
         self._check_for_simplification_of_boolop(node)
