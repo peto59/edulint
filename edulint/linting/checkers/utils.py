@@ -17,7 +17,22 @@ import sys
 import inspect
 import operator
 from pylint.checkers import utils  # type: ignore
-from z3 import ExprRef, ArithRef, Int, Real, And, Or, IntVal, RealVal, BoolVal, is_int
+from z3 import (
+    ExprRef,
+    ArithRef,
+    Int,
+    Real,
+    And,
+    Or,
+    IntVal,
+    RealVal,
+    BoolVal,
+    is_int,
+    Then,
+    Tactic,
+    solver,
+    Not,
+)
 
 EXPRESSION_TYPES = (
     nodes.Subscript,
@@ -157,7 +172,15 @@ def _not_allowed_node(
     )
 
 
-def _initialize_variables(
+def _is_abs_function(node: nodes.NodeNG) -> bool:
+    return (
+        isinstance(node, nodes.Call)
+        and isinstance(node.func, nodes.Name)
+        and node.func.name == "abs"
+    )
+
+
+def initialize_variables(
     node: nodes.NodeNG,
     initialized_variables: Dict[str, ArithRef],
     is_descendant_of_integer_operation: bool,
@@ -170,16 +193,21 @@ def _initialize_variables(
         return False
 
     if isinstance(node, nodes.BinOp) and (node.op == "%" or node.op == "//"):
-        return _initialize_variables(node.left, initialized_variables, True, node)
+        return initialize_variables(node.left, initialized_variables, True, node)
 
     if isinstance(node, (nodes.BoolOp, nodes.Compare, nodes.UnaryOp, nodes.BinOp)):
         for child in node.get_children():
-            if not _initialize_variables(
+            if not initialize_variables(
                 child, initialized_variables, is_descendant_of_integer_operation, node
             ):
                 return False
 
         return True
+
+    if _is_abs_function(node):
+        return initialize_variables(
+            node.args[0], initialize_variables, is_descendant_of_integer_operation, node
+        )
 
     # Thanks to the purity of the original node we can work with all these types as variables.
     if isinstance(node, (nodes.Name, nodes.Subscript, nodes.Attribute, nodes.Call)):
@@ -244,6 +272,10 @@ def convert_condition_to_z3_expression(
 
     if node is None:
         return None
+
+    if _is_abs_function(node):
+        # TODO - try to write my own abs function that takes 0 arguments, if this breaks.
+        expr = convert_condition_to_z3_expression(node.args[0], initialized_variables, node)
 
     if _is_variable_in_pure_expression(node):
         return _convert_to_bool_if_necessary(node, parent, initialized_variables[node.as_string()])
@@ -325,6 +357,15 @@ def convert_condition_to_z3_expression(
 
     if isinstance(node, nodes.UnaryOp):
         expr = convert_condition_to_z3_expression(node.operand, initialized_variables, node)
+
+        if expr is None:
+            return None
+
+        if node.op == "-":
+            expr = -expr
+        elif node.op == "not":
+            expr = Not(expr)
+
         return _convert_to_bool_if_necessary(node, parent, expr)
 
     # Should not be reachable
@@ -332,8 +373,7 @@ def convert_condition_to_z3_expression(
 
 
 def implies(node1: nodes.NodeNG, node2: nodes.NodeNG) -> bool:
-    # TODO
-    return False
+    pass
 
 
 def is_multi_assign(node: nodes.NodeNG) -> bool:
